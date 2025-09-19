@@ -1,26 +1,42 @@
 import asyncio
-import configio
-from configio import Route, Codec
+from configio import ConfigIO, Loader, Codec, Route
 from pathlib import Path
 
 from pprint import pprint
 
 
 async def main():
-    path = Path("config.yaml")
+    loader = Loader.DATA
     codec = Codec.YAML
+    path = Path("test.yaml")
+
+    # SET
     value = {"IR": "Tehran/Asia", "JP": "Tokyo/Asia", "IQ": "Baghdad/Asia"}
-    result = await configio.set(
-        path,
-        Route("settings", "timezone", "tzs"),
-        value,
+    data = await ConfigIO.set(
+        loader,
         codec,
+        data={"timezones": None},
+        path=path,
+        route=Route("timezones"),
+        value=value,
         threadsafe=True,
-        overwrite_conflicts=False,
+        overwrite_conflicts=True,
+        save=True,
     )
-    print("Save Success:", result)
-    data = await configio.get(path, None, codec, threadsafe=True)
     pprint(data)
+
+    # DELETE
+    # result = await ConfigIO.delete(
+    #     loader,
+    #     codec,
+    #     path=path,
+    #     route=Route("NOBITEX", "endpoints", "assets", "url"),
+    #     threadsafe=True,
+    #     drop=False,
+    #     save=True,
+    # )
+
+    # data = await ConfigIO.get(loader, codec, path=path, threadsafe=True)
 
 
 if __name__ == "__main__":

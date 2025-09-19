@@ -1,0 +1,61 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cfgio"
+dynamic = ["version"]
+description = "Unified async JSON/YAML config I/O with routed access for files and in-memory data, featuring atomic saves and thread-offloaded parsing."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Moh-Dehghan", email = "m.dehghan.2003@outlook.com" }]
+keywords = [
+    "config",
+    "settings",
+    "json",
+    "yaml",
+    "async",
+    "asyncio",
+    "file-io",
+    "atomic-write",
+    "persistence",
+    "routing",
+    "path-routing",
+    "pyroute",
+    "in-memory",
+    "loader",
+    "mapping",
+    "nested",
+]
+dependencies = ["aiofiles>=23.0.0", "pyyaml>=6.0.0", "pyroute>=1.0.0"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Framework :: AsyncIO",
+    "Operating System :: OS Independent",
+    "Topic :: Internet",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.urls]
+Homepage = "https://github.com/moh-dehghan/configio"
+Repository = "https://github.com/moh-dehghan/configio"
+Issues = "https://github.com/moh-dehghan/configio/issues"
+
+[tool.hatch.version]
+path = "configio/__init__.py"
+
+[tool.hatch.build.targets.sdist]
+include = ["configio/**", "README.md", "LICENSE"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["configio"]
+include = ["configio/py.typed"]

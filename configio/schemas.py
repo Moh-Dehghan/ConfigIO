@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pathlib import Path
+import os
 from enum import Enum
 from typing import (
     Union,
@@ -25,7 +25,12 @@ Data: TypeAlias = Union[
     MutableSet["Data"],  # e.g., set (YAML can contain sets)
 ]
 
-PathLike = Union[Path, str]
+PathLike = Union[str, os.PathLike[str]]
+
+
+class Loader(Enum):
+    FILE = "FILE"
+    DATA = "DATA"
 
 
 class Codec(Enum):

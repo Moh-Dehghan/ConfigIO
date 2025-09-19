@@ -1,197 +1,352 @@
 """
-configio
-========
+configio — Unified async config I/O (FILE or DATA) for JSON/YAML with routed access.
 
-Async JSON/YAML config I/O with routed access.
+A single loader-driven API via `ConfigIO` that works on files (FILE) or on
+in-memory Python documents (DATA). Nested access/mutation is routed with
+`pyroute.Route` and implemented by `_get`, `_set`, `_delete`.
 
-This module is a thin, high-level façade over the per-format backends
-(`jsonio` and `yamlio`) plus path navigation powered by `pyroute.Route`.
-It exposes two async helpers:
+Modes
+-----
+FILE (`loader=Loader.FILE`)
+    Operates on `path` (PathLike); parses/dumps via `configio.jsonio` / `configio.yamlio`
+    with best-effort atomic writes when saving.
 
-- `get(path, route=None, codec=None, *, threadsafe=False) -> Optional[Any]`
-    Read a document and optionally return a nested value addressed by a `Route`.
-    Missing paths or recoverable parse/type errors yield `None`.
-
-- `set(path, route=None, value=None, codec=None, *, threadsafe=False,
-       overwrite_conflicts=False) -> bool`
-    Read a document, apply a routed update, and persist the result using the
-    corresponding backend. Returns `True` on success.
-
-Key properties
---------------
-- **Formats**: JSON and YAML. The codec may be provided explicitly or inferred
-  from the file extension via `_infer_codec`.
-- **Path routing**: Uses `pyroute.Route` (immutable, hashable) to address nested
-  keys inside mapping-based configs.
-- **Async I/O**: Files are read/written using `aiofiles`.
-- **Thread offload**: Parsing/dumping can be offloaded to a worker thread when
-  `threadsafe=True` to avoid blocking the event loop on large payloads.
-- **Atomic saves**: Backends (`jsonio.save` / `yamlio.save`) perform best-effort
-  atomic writes (temp file + `os.replace(...)`).
-
-Return / error semantics
-------------------------
-- `get(...)`
-    - Returns the whole document when `route` is `None`/empty.
-    - Returns `None` when the route is missing or on recoverable parse/type errors.
-    - **Raises** `OSError` (e.g., `FileNotFoundError`, permission issues).
-- `set(...)`
-    - Returns `True` on success; `False` on recoverable failures (parse/type/value).
-    - **Raises** `OSError` (e.g., `FileNotFoundError`, permission issues).
+DATA (`loader=Loader.DATA`)
+    Operates directly on `data`. If you pass `path` and set `save=True` in `set`/`delete`,
+    the updated document is persisted like FILE mode.
 
 Notes
 -----
-The traversal and mutation logic lives in `_get` / `_set` (from `configio.utils`).
-By design, `_set` performs defensive updates (deep-copy first) and supports an
-`overwrite_conflicts` flag to destructively convert non-mapping intermediates
-into `{}` when you must reach the target route.
+- `codec` is required everywhere (no extension inference here).
+- FILE mode requires `path`; DATA mode requires `data`.
+- `threadsafe=True` offloads heavy parse/dump to a worker thread (FILE mode).
+- Recoverable issues are logged; `get` returns `None` on such cases. Filesystem `OSError`s
+  are propagated.
 
-Examples
---------
->>> await get("config.yaml", Route("server", "port"))
->>> await set("config.json", Route("features", "beta"), True)
+Terminology
+-----------
+`PathLike` here means `Union[str, os.PathLike[str]]`; at runtime both plain strings
+and `os.PathLike` objects are accepted.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
+import os
 from typing import Any, Optional, Literal
 
 from pyroute import Route
 from configio import jsonio, yamlio
-from configio.utils import _infer_codec, _get, _set
-from configio.schemas import PathLike, Codec
+from configio.logger import logger
+from configio.utils import _get, _set, _delete
+from configio.schemas import PathLike, Data, Loader, Codec
 
-# Precise exception types for parse errors
 from json import JSONDecodeError
 from yaml import YAMLError
 
 
-async def get(
-    path: PathLike,
-    route: Optional[Route] = None,
-    codec: Optional[Literal[Codec.JSON, Codec.YAML]] = None,
-    *,
-    threadsafe: bool = False,
-) -> Optional[Any]:
-    """
-    Read a JSON/YAML file and optionally return a nested value.
-
-    If `route` is falsy (None or empty), the entire document is returned.
-    Otherwise, the value at the given `route` is returned. When the route
-    is missing or a recoverable parse/type error occurs, `None` is returned.
-
-    Args:
-        path: Filesystem path to the document (str or Path).
-        route: A `Route` of hashable segments (keys). If None/empty, returns
-               the full document.
-        codec: Explicit codec (`Codec.JSON` or `Codec.YAML`). If omitted, it is
-               inferred from the file extension via `_infer_codec`.
-        threadsafe: When True, the backend parser offloads CPU-bound parsing to
-                    a worker thread (recommended for large files).
-
-    Returns:
-        The nested value addressed by `route`, the entire document (when `route`
-        is falsy), or `None` if the path is missing or on parse/type errors.
-
-    Raises:
-        OSError: On filesystem errors (e.g., FileNotFoundError, permission issues).
-    """
-    # Normalize and validate path
-    if isinstance(path, str):
-        p = Path(path)
-    elif isinstance(path, Path):
-        p = path
-    else:
-        raise TypeError("path must be Path or str.")
-
-    # Infer codec once
-    fmt = _infer_codec(p, codec)
-
-    try:
-        if fmt == Codec.JSON:
-            data = await jsonio.load(str(p), threadsafe=threadsafe)
-            return _get(data, route)
-        elif fmt == Codec.YAML:
-            data = await yamlio.load(str(p), threadsafe=threadsafe)
-            return _get(data, route)
-        # Unsupported codec → behave like "not found"
-        return None
-    except OSError:
-        # Propagate filesystem errors so callers can distinguish them
-        raise
-    except (KeyError, TypeError, JSONDecodeError, YAMLError):
-        # Missing route or recoverable parse/type errors
-        return None
+__all__ = ("ConfigIO", "Loader", "Codec", "Route")
+__version__ = "1.0.0"
 
 
-async def set(
-    path: PathLike,
-    route: Optional[Route] = None,
-    value: Optional[Any] = None,
-    codec: Optional[Literal[Codec.JSON, Codec.YAML]] = None,
-    *,
-    threadsafe: bool = False,
-    overwrite_conflicts: bool = False,
-) -> bool:
-    """
-    Update a JSON/YAML file at a nested route and persist the result.
+class ConfigIO:
+    @staticmethod
+    async def get(
+        loader: Literal[Loader.FILE, Loader.DATA],
+        codec: Literal[Codec.JSON, Codec.YAML],
+        *,
+        data: Data = None,
+        path: Optional[PathLike] = None,
+        route: Optional[Route] = None,
+        threadsafe: bool = False,
+    ) -> Optional[Any]:
+        """
+        Read a JSON/YAML document and optionally return a nested value.
 
-    When `route` is falsy (None or empty), the entire document is replaced with
-    `value`. Otherwise, `_set` writes `value` at the provided `route`, creating
-    intermediate containers as needed. The appropriate backend persists the
-    updated document using best-effort atomic writes.
+        Args:
+            loader: FILE (read from `path`) or DATA (use `data` directly).
+            codec: `Codec.JSON` or `Codec.YAML`.
+            data: In-memory document (required in DATA mode).
+            path: Filesystem path (PathLike = str | os.PathLike; required in FILE mode).
+            route: Nested path. If falsy (None/empty), returns the whole document.
+            threadsafe: Offload heavy parse to a worker thread (FILE mode).
 
-    Args:
-        path: Filesystem path to the document (str or Path).
-        route: A `Route` of hashable segments (keys). If None/empty, the root
-               is replaced with `value`.
-        value: The value to assign at `route`.
-        codec: Explicit codec (`Codec.JSON` or `Codec.YAML`). If omitted, it is
-               inferred from the file extension via `_infer_codec`.
-        threadsafe: When True, backend dump/parse operations are offloaded to a
-                    worker thread to keep the event loop responsive.
-        overwrite_conflicts: If True, `_set` will replace conflicting non-mapping
-                             intermediates with `{}` to reach the target path.
-                             If False (default), such conflicts raise `TypeError`.
+        Returns:
+            The entire document.
+            Returns `None` on recoverable issues (e.g., missing route/type mismatch).
 
-    Returns:
-        True on success; False on recoverable failures (parse/type/value).
+        Raises:
+            TypeError: Missing/malformed required args for the selected mode.
+            ValueError: Invalid `codec`.
+            OSError: Filesystem errors in FILE mode.
+        """
+        if loader == Loader.DATA:
+            try:
+                if codec in (Codec.JSON, Codec.YAML):
+                    return _get(data, route)
+                raise ValueError("Invalid Codec.")
+            except OSError:
+                raise
+            except (KeyError, TypeError) as e:
+                logger.error(f"[{__name__.upper()}] Error: {e}")
+        elif loader == Loader.FILE:
+            if not isinstance(path, (str, os.PathLike)):
+                raise TypeError("path must be str or os.PathLike")
+            try:
+                if codec == Codec.JSON:
+                    return _get(await jsonio.load(path, threadsafe=threadsafe), route)
+                elif codec == Codec.YAML:
+                    return _get(await yamlio.load(path, threadsafe=threadsafe), route)
+                else:
+                    raise ValueError("Invalid Codec.")
+            except OSError:
+                raise
+            except (KeyError, TypeError, JSONDecodeError, YAMLError) as e:
+                logger.error(f"[{__name__.upper()}] Error: {e}")
+        else:
+            raise ValueError("Invalid Loader")
 
-    Raises:
-        OSError: On filesystem errors (e.g., FileNotFoundError, permission issues).
+    @staticmethod
+    async def set(
+        loader: Literal[Loader.FILE, Loader.DATA],
+        codec: Literal[Codec.JSON, Codec.YAML],
+        *,
+        data: Data = None,
+        path: Optional[PathLike] = None,
+        route: Optional[Route] = None,
+        value: Optional[Any] = None,
+        threadsafe: bool = False,
+        overwrite_conflicts: bool = False,
+        save: bool = True,
+    ) -> Data:
+        """
+        Update a document at `route` and optionally persist.
 
-    Notes:
-        This function reads the current document first, applies the update via
-        `_set`, and then saves it using the appropriate backend (`jsonio`/`yamlio`).
-    """
-    # Normalize and validate path
-    if isinstance(path, str):
-        p = Path(path)
-    elif isinstance(path, Path):
-        p = path
-    else:
-        raise TypeError("path must be Path or str.")
+        Behavior:
+        - Always returns the **updated document** (even when `save=True`).
+        - In DATA mode with `save=True`, `path` is required and persistence mirrors FILE mode.
 
-    # Infer codec once
-    fmt = _infer_codec(p, codec)
+        Args:
+            loader: FILE (operate via `path`) or DATA (operate on `data`).
+            codec: `Codec.JSON` or `Codec.YAML`.
+            data: In-memory document (required in DATA mode).
+            path: Destination/source path (PathLike = str | os.PathLike).
+            route: Nested path; if falsy, the root is replaced by `value`.
+            value: Value to write at `route`.
+            threadsafe: Offload heavy parse/dump (FILE mode).
+            overwrite_conflicts: If True, non-mapping intermediates become `{}`.
+            save: If True, persist the updated document (requires `path` in DATA mode).
 
-    try:
-        if fmt == Codec.JSON:
-            data = await jsonio.load(str(p), threadsafe=threadsafe)
-            new_data = _set(data, route, value, overwrite_conflicts=overwrite_conflicts)
-            await jsonio.save(str(p), new_data, threadsafe=threadsafe)
-            return True
-        elif fmt == Codec.YAML:
-            data = await yamlio.load(str(p), threadsafe=threadsafe)
-            new_data = _set(data, route, value, overwrite_conflicts=overwrite_conflicts)
-            await yamlio.save(str(p), new_data, threadsafe=threadsafe)
-            return True
-        # Unsupported codec
-        return False
-    except OSError:
-        # Propagate so callers can decide how to handle "file not found", etc.
-        raise
-    except (KeyError, TypeError, ValueError, JSONDecodeError, YAMLError):
-        # Any recoverable failure → consistent False
+        Returns:
+            The updated document (`Data`) on success; `None` if a logged error occurred.
+
+        Raises:
+            TypeError: Missing/malformed required args for the selected mode.
+            ValueError: Invalid `codec`, or DATA+`save=True` without `path`.
+            OSError: Propagated filesystem errors when persisting.
+        """
+        if loader == Loader.DATA:
+            try:
+                document = _set(
+                    data, route, value, overwrite_conflicts=overwrite_conflicts
+                )
+                if not save:
+                    return document
+                if not isinstance(path, (str, os.PathLike)):
+                    raise TypeError("path must be str or os.PathLike")
+                if codec in (Codec.JSON, Codec.YAML):
+                    if save:
+                        if not await ConfigIO.save(
+                            codec, document, path, threadsafe=threadsafe
+                        ):
+                            raise OSError(
+                                f"Unexpected error while saving {path} | {codec.value}"
+                            )
+                    return document
+                else:
+                    raise ValueError("Invalid Codec.")
+            except (KeyError, TypeError, ValueError, JSONDecodeError, YAMLError) as e:
+                logger.error(f"[{__name__.upper()}] Error: {e}")
+        elif loader == Loader.FILE:
+            if not isinstance(path, (str, os.PathLike)):
+                raise TypeError("path must be str or os.PathLike")
+            try:
+                if codec == Codec.JSON:
+                    document = _set(
+                        await jsonio.load(path, threadsafe=threadsafe),
+                        route,
+                        value,
+                        overwrite_conflicts=overwrite_conflicts,
+                    )
+                    if save:
+                        if not await ConfigIO.save(
+                            codec, document, path, threadsafe=threadsafe
+                        ):
+                            raise OSError(
+                                f"Unexpected error while saving {path} | {codec.value}"
+                            )
+                    return document
+                elif codec == Codec.YAML:
+                    document = _set(
+                        await yamlio.load(path, threadsafe=threadsafe),
+                        route,
+                        value,
+                        overwrite_conflicts=overwrite_conflicts,
+                    )
+                    if save:
+                        if not await ConfigIO.save(
+                            codec, document, path, threadsafe=threadsafe
+                        ):
+                            raise OSError(
+                                f"Unexpected error while saving {path} | {codec.value}"
+                            )
+                    return document
+                else:
+                    raise ValueError("Invalid Codec.")
+            except OSError:
+                raise
+            except (KeyError, TypeError, ValueError, JSONDecodeError, YAMLError) as e:
+                logger.error(f"[{__name__.upper()}] Error: {e}")
+        else:
+            raise ValueError("Invalid Loader")
+
+    @staticmethod
+    async def delete(
+        loader: Literal[Loader.FILE, Loader.DATA],
+        codec: Literal[Codec.JSON, Codec.YAML],
+        *,
+        data: Data = None,
+        path: Optional[PathLike] = None,
+        route: Optional[Route] = None,
+        threadsafe: bool = False,
+        drop: bool = False,
+        save: bool = True,
+    ) -> Data:
+        """
+        Delete using routed semantics and optionally persist.
+
+        Semantics (via `_delete`):
+        - Falsy `route` ⇒ whole-document delete (returns `None`).
+        - `drop=False` (default): remove subtree; if its immediate parent becomes empty,
+          replace that parent with `None` in its parent. Special case: `len(route)==1`
+          ⇒ `root[key] = None`.
+        - `drop=True`: remove the key and prune empty parents bottom-up.
+
+        Behavior:
+        - Always returns the **updated document** (even when `save=True`).
+        - In DATA mode with `save=True`, `path` is required and persistence mirrors FILE mode.
+
+        Args:
+            loader: FILE (operate via `path`) or DATA (operate on `data`).
+            codec: `Codec.JSON` or `Codec.YAML`.
+            data: In-memory document (required in DATA mode).
+            path: Destination/source path (PathLike = str | os.PathLike).
+            route: Target path to delete.
+            threadsafe: Offload heavy parse/dump (FILE mode).
+            drop: Prune mode (see semantics).
+            save: If True, persist the updated document (requires `path` in DATA mode).
+
+        Returns:
+            The updated document (`Data`) on success; `None` if a logged error occurred.
+
+        Raises:
+            TypeError: Missing/malformed required args for the selected mode.
+            ValueError: Invalid `codec`, or DATA+`save=True` without `path`.
+            OSError: Propagated filesystem errors when persisting.
+        """
+        if loader == Loader.DATA:
+            try:
+                document = _delete(data, route, drop=drop)
+                if not save:
+                    return document
+                if not isinstance(path, (str, os.PathLike)):
+                    raise TypeError("path must be str or os.PathLike")
+                if codec in (Codec.JSON, Codec.YAML):
+                    if not await ConfigIO.save(
+                        codec, document, path, threadsafe=threadsafe
+                    ):
+                        raise OSError(
+                            f"Unexpected error while saving {path} | {codec.value}"
+                        )
+                    return document
+                else:
+                    raise ValueError("Invalid Codec.")
+            except (KeyError, TypeError, ValueError, JSONDecodeError, YAMLError) as e:
+                logger.error(f"[{__name__.upper()}] Error: {e}")
+        elif loader == Loader.FILE:
+            if not isinstance(path, (str, os.PathLike)):
+                raise TypeError("path must be str or os.PathLike")
+            try:
+                if codec == Codec.JSON:
+                    document = _delete(
+                        await jsonio.load(path, threadsafe=threadsafe), route, drop=drop
+                    )
+                    if save:
+                        if not await ConfigIO.save(
+                            codec, document, path, threadsafe=threadsafe
+                        ):
+                            raise OSError(
+                                f"Unexpected error while saving {path} | {codec.value}"
+                            )
+                    return document
+                elif codec == Codec.YAML:
+                    document = _delete(
+                        await yamlio.load(path, threadsafe=threadsafe), route, drop=drop
+                    )
+                    if save:
+                        if not await ConfigIO.save(
+                            codec, document, path, threadsafe=threadsafe
+                        ):
+                            raise OSError(
+                                f"Unexpected error while saving {path} | {codec.value}"
+                            )
+                    return document
+                else:
+                    raise ValueError("Invalid Codec.")
+            except OSError:
+                raise
+            except (KeyError, TypeError, ValueError, JSONDecodeError, YAMLError) as e:
+                logger.error(f"[{__name__.upper()}] Error: {e}")
+        else:
+            raise ValueError("Invalid Loader")
+
+    @staticmethod
+    async def save(
+        codec: Literal[Codec.JSON, Codec.YAML],
+        data: Data,
+        path: PathLike,
+        *,
+        threadsafe: bool = False,
+    ) -> bool:
+        """
+        Persist a document to disk using the specified `codec`.
+
+        Args:
+            codec: `Codec.JSON` or `Codec.YAML`.
+            data: Python document to persist.
+            path: Destination (PathLike = str | os.PathLike).
+            threadsafe: Offload heavy dump to a worker thread.
+
+        Returns:
+            True on success; False on recoverable serialization/logging errors.
+
+        Raises:
+            TypeError: If `path` is not str/os.PathLike.
+            ValueError: Invalid `codec`.
+            OSError: Propagated filesystem errors (e.g., permission issues).
+        """
+        if not isinstance(path, (str, os.PathLike)):
+            raise TypeError("path must be str or os.PathLike")
+        try:
+            if codec == Codec.JSON:
+                await jsonio.save(path, data, threadsafe=threadsafe)
+                return True
+            elif codec == Codec.YAML:
+                await yamlio.save(path, data, threadsafe=threadsafe)
+                return True
+            else:
+                raise ValueError("Invalid Codec.")
+        except OSError:
+            raise
+        except (JSONDecodeError, YAMLError, TypeError, ValueError) as e:
+            logger.error(f"[{__name__.upper()}] Error: {e}")
         return False

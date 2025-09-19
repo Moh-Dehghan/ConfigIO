@@ -2,36 +2,12 @@ from __future__ import annotations
 
 import os
 import uuid
-from typing import Any, Optional, Literal
+from typing import Any, Optional, List, Hashable
 from collections.abc import MutableMapping
 from copy import deepcopy
-from pathlib import Path
 
 from pyroute import Route
-from configio.schemas import PathLike, Data, Codec
-
-
-def _infer_codec(
-    path: Path, codec: Optional[Literal[Codec.JSON, Codec.YAML]]
-) -> Literal[Codec.JSON, Codec.YAML]:
-    """
-    Infer the codec from the given file path if not explicitly provided.
-
-    Priority:
-      1) explicit `codec` argument
-      2) file extension: .json -> JSON, .yml/.yaml -> YAML
-      3) default -> JSON
-    """
-    if codec is not None:
-        if isinstance(codec, Codec):
-            return codec
-        raise TypeError(f"codec ({codec}) not valid.")
-    ext = path.suffix.lower()
-    if ext == ".json":
-        return Codec.JSON
-    elif ext in (".yml", ".yaml"):
-        return Codec.YAML
-    raise TypeError(f"file format/codec ({ext}) not valid.")
+from configio.schemas import PathLike, Data
 
 
 def _random_temp(path: PathLike) -> str:
@@ -161,4 +137,82 @@ def _set(
         )
 
     cur[route[-1]] = value
+    return root
+
+
+def _delete(
+    data: Data,
+    route: Optional[Route] = None,
+    *,
+    drop: bool = False,
+) -> Data:
+    """
+    Delete semantics with copy-on-write (mirrors `_set`'s return style).
+
+    If `route` is falsy (None or empty), the WHOLE document is deleted
+    and `None` is returned.
+
+    Modes (when `route` is non-empty):
+        - drop=True  : remove key; prune empty parents bottom-up.
+        - drop=False : remove subtree; if the immediate parent becomes empty,
+                       replace that parent (in its own parent) with `None`.
+                       Special-case: when len(route) == 1 -> root[key] = None
+                       (even if key didn't exist before).
+
+    Behavior:
+        - Missing or malformed paths are silent no-ops (return unchanged copy).
+        - Always deep-copies `data` and returns the modified root.
+    """
+    # Delete-whole-document
+    if not route:
+        return None
+
+    root = deepcopy(data)
+
+    # If root is not a mapping, partial delete is a no-op.
+    if not isinstance(root, MutableMapping):
+        return root
+
+    # Top-level special case for delete-mode (non-drop, 1-segment route)
+    if not drop and len(route) == 1:
+        root[route[0]] = None
+        return root
+
+    # Walk to the parent of the target key
+    cur = root
+    parents: List[MutableMapping[Hashable, Any]] = []
+    keys: List[Hashable] = []
+    for seg in route[:-1]:
+        if not isinstance(cur, MutableMapping) or seg not in cur:
+            return root  # no-op if path missing/malformed
+        parents.append(cur)
+        keys.append(seg)
+        cur = cur[seg]
+
+    if not isinstance(cur, MutableMapping):
+        return root  # malformed path → no-op
+
+    target = route[-1]
+    if target not in cur:
+        return root  # nothing to delete
+
+    # Remove the target subtree (or leaf)
+    cur.pop(target)
+
+    if drop:
+        # Prune empty parents bottom-up
+        node = cur
+        for gp, k in zip(reversed(parents), reversed(keys)):
+            if isinstance(node, MutableMapping) and not node:
+                gp.pop(k, None)
+                node = gp
+            else:
+                break
+    else:
+        # Collapse only the immediate parent to None if it became empty
+        if not cur and parents:
+            gp = parents[-1]
+            key_of_parent = keys[-1]
+            gp[key_of_parent] = None
+
     return root
