@@ -7,7 +7,11 @@ import yaml
 from aiofiles import os as aios
 
 from configio.utils import _random_temp
-from configio.schemas import PathLike, Data
+from configio.schemas import DataType, PathType
+
+
+__all__ = ("load", "save")
+
 
 # Loader
 try:
@@ -22,7 +26,7 @@ except Exception:
     Dumper = yaml.SafeDumper
 
 
-async def load(path: PathLike, threadsafe: bool = False) -> Data:
+async def load(path: PathType, threadsafe: bool = False) -> DataType:
     """
     Read a YAML file asynchronously and parse it into a Python object.
 
@@ -46,7 +50,7 @@ async def load(path: PathLike, threadsafe: bool = False) -> Data:
     return yaml.load(text, Loader=Loader)
 
 
-async def save(path: PathLike, data: Data, threadsafe: bool = False) -> None:
+async def save(path: PathType, data: DataType, threadsafe: bool = False) -> None:
     """
     Serialize a Python object to YAML and write it to disk atomically.
 
@@ -59,7 +63,7 @@ async def save(path: PathLike, data: Data, threadsafe: bool = False) -> None:
         yaml.YAMLError on representer/dump errors.
     """
 
-    def _dump_str(d: Data) -> str:
+    def _dump_str(d: DataType) -> str:
         return yaml.dump(d, Dumper=Dumper, allow_unicode=True, sort_keys=False)
 
     text = await asyncio.to_thread(_dump_str, data) if threadsafe else _dump_str(data)

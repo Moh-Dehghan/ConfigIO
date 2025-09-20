@@ -1,32 +1,34 @@
 """
-configio — Unified async config I/O (FILE or DATA) for JSON/YAML with routed access.
+ConfigIO — Unified async config I/O (FILE or DATA) for JSON/YAML with routed access.
 
-A single loader-driven API via `ConfigIO` that works on files (FILE) or on
+A single, loader-driven API via `ConfigIO` that works on files (FILE) or on
 in-memory Python documents (DATA). Nested access/mutation is routed with
 `pyroute.Route` and implemented by `_get`, `_set`, `_delete`.
 
-Modes
+Loaders
 -----
 FILE (`loader=Loader.FILE`)
-    Operates on `path` (PathLike); parses/dumps via `configio.jsonio` / `configio.yamlio`
-    with best-effort atomic writes when saving.
+    Operates on `path` (PathType); parses/dumps via `configio.jsonio` /
+    `configio.yamlio` with best-effort atomic writes when saving.
 
 DATA (`loader=Loader.DATA`)
-    Operates directly on `data`. If you pass `path` and set `save=True` in `set`/`delete`,
-    the updated document is persisted like FILE mode.
+    Operates directly on `data`. If you also pass `path` and set `save=True`
+    in `set`/`delete`, the updated document is persisted like FILE mode.
 
 Notes
 -----
-- `codec` is required everywhere (no extension inference here).
+- `codec` requirements:
+  * FILE mode: **required** (`Codec.JSON` or `Codec.YAML`).
+  * DATA mode: **required only when persisting** (`save=True`); otherwise ignored.
 - FILE mode requires `path`; DATA mode requires `data`.
-- `threadsafe=True` offloads heavy parse/dump to a worker thread (FILE mode).
-- Recoverable issues are logged; `get` returns `None` on such cases. Filesystem `OSError`s
-  are propagated.
+- `threadsafe=True` offloads heavy parse/dump to a worker thread (relevant to FILE mode).
+- Recoverable issues are logged. Some methods may return `None` in such cases even
+  though the return annotation is `DataType`; treat as `DataType | None` at call sites.
 
 Terminology
 -----------
-`PathLike` here means `Union[str, os.PathLike[str]]`; at runtime both plain strings
-and `os.PathLike` objects are accepted.
+`PathType` means `Union[str, os.PathLike[str]]`. At runtime, both plain strings and
+`os.PathLike` objects are accepted.
 """
 
 from __future__ import annotations
@@ -38,52 +40,58 @@ from pyroute import Route
 from configio import jsonio, yamlio
 from configio.logger import logger
 from configio.utils import _get, _set, _delete
-from configio.schemas import PathLike, Data, Loader, Codec
+from configio.schemas import DataType, PathType, Loader, Codec
 
 from json import JSONDecodeError
 from yaml import YAMLError
 
 
 __all__ = ("ConfigIO", "Loader", "Codec", "Route")
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 
 class ConfigIO:
     @staticmethod
     async def get(
         loader: Literal[Loader.FILE, Loader.DATA],
-        codec: Literal[Codec.JSON, Codec.YAML],
         *,
-        data: Data = None,
-        path: Optional[PathLike] = None,
+        codec: Optional[Literal[Codec.JSON, Codec.YAML]] = None,
+        data: DataType = None,
+        path: Optional[PathType] = None,
         route: Optional[Route] = None,
         threadsafe: bool = False,
-    ) -> Optional[Any]:
+    ) -> DataType:
         """
-        Read a JSON/YAML document and optionally return a nested value.
+        Read a JSON/YAML document and optionally return a routed value.
 
         Args:
-            loader: FILE (read from `path`) or DATA (use `data` directly).
-            codec: `Codec.JSON` or `Codec.YAML`.
-            data: In-memory document (required in DATA mode).
-            path: Filesystem path (PathLike = str | os.PathLike; required in FILE mode).
-            route: Nested path. If falsy (None/empty), returns the whole document.
-            threadsafe: Offload heavy parse to a worker thread (FILE mode).
+            loader:
+                - `Loader.FILE`: read via `path`.
+                - `Loader.DATA`: use `data` directly.
+            codec:
+                Required in FILE mode (`Codec.JSON` / `Codec.YAML`).
+                Ignored in DATA mode.
+            data:
+                In-memory document (required in DATA mode).
+            path:
+                Filesystem path (`str | os.PathLike`; required in FILE mode).
+            route:
+                Nested path. If falsy (None/empty), the entire document is returned.
+            threadsafe:
+                Offload heavy parse to a worker thread (FILE mode).
 
         Returns:
-            The entire document.
-            Returns `None` on recoverable issues (e.g., missing route/type mismatch).
+            Routed value or the entire document when `route` is falsy.
+            On recoverable issues this may return `None` (treat as `DataType | None`).
 
         Raises:
             TypeError: Missing/malformed required args for the selected mode.
-            ValueError: Invalid `codec`.
+            ValueError: Invalid `codec` in FILE mode.
             OSError: Filesystem errors in FILE mode.
         """
         if loader == Loader.DATA:
             try:
-                if codec in (Codec.JSON, Codec.YAML):
-                    return _get(data, route)
-                raise ValueError("Invalid Codec.")
+                return _get(data, route)
             except OSError:
                 raise
             except (KeyError, TypeError) as e:
@@ -108,40 +116,52 @@ class ConfigIO:
     @staticmethod
     async def set(
         loader: Literal[Loader.FILE, Loader.DATA],
-        codec: Literal[Codec.JSON, Codec.YAML],
         *,
-        data: Data = None,
-        path: Optional[PathLike] = None,
+        codec: Optional[Literal[Codec.JSON, Codec.YAML]] = None,
+        data: DataType = None,
+        path: Optional[PathType] = None,
         route: Optional[Route] = None,
         value: Optional[Any] = None,
         threadsafe: bool = False,
         overwrite_conflicts: bool = False,
         save: bool = True,
-    ) -> Data:
+    ) -> DataType:
         """
         Update a document at `route` and optionally persist.
 
         Behavior:
         - Always returns the **updated document** (even when `save=True`).
-        - In DATA mode with `save=True`, `path` is required and persistence mirrors FILE mode.
+        - DATA mode: `codec` is **only required when `save=True`** (and `path` must be set).
+        - FILE mode: `codec` and `path` are required.
 
         Args:
-            loader: FILE (operate via `path`) or DATA (operate on `data`).
-            codec: `Codec.JSON` or `Codec.YAML`.
-            data: In-memory document (required in DATA mode).
-            path: Destination/source path (PathLike = str | os.PathLike).
-            route: Nested path; if falsy, the root is replaced by `value`.
-            value: Value to write at `route`.
-            threadsafe: Offload heavy parse/dump (FILE mode).
-            overwrite_conflicts: If True, non-mapping intermediates become `{}`.
-            save: If True, persist the updated document (requires `path` in DATA mode).
+            loader:
+                - `Loader.FILE`: operate via `path`.
+                - `Loader.DATA`: operate on `data`.
+            codec:
+                FILE mode: required. DATA mode: required only if `save=True`.
+            data:
+                In-memory document (required in DATA mode).
+            path:
+                Source/destination path (`str | os.PathLike`).
+            route:
+                Target path. If falsy, replaces the root with `value`.
+            value:
+                Value to assign at `route`.
+            threadsafe:
+                Offload heavy parse/dump (FILE mode).
+            overwrite_conflicts:
+                If True, non-mapping intermediates are replaced with `{}`.
+            save:
+                If True, persist (requires `path`; in DATA mode also a valid `codec`).
 
         Returns:
-            The updated document (`Data`) on success; `None` if a logged error occurred.
+            Updated document on success. On recoverable issues this may return `None`
+            (treat as `DataType | None`).
 
         Raises:
             TypeError: Missing/malformed required args for the selected mode.
-            ValueError: Invalid `codec`, or DATA+`save=True` without `path`.
+            ValueError: Invalid `codec` (FILE mode, or DATA+`save=True`), or DATA+`save=True` without `path`.
             OSError: Propagated filesystem errors when persisting.
         """
         if loader == Loader.DATA:
@@ -151,19 +171,20 @@ class ConfigIO:
                 )
                 if not save:
                     return document
+                # Validate Path
                 if not isinstance(path, (str, os.PathLike)):
                     raise TypeError("path must be str or os.PathLike")
-                if codec in (Codec.JSON, Codec.YAML):
-                    if save:
-                        if not await ConfigIO.save(
-                            codec, document, path, threadsafe=threadsafe
-                        ):
-                            raise OSError(
-                                f"Unexpected error while saving {path} | {codec.value}"
-                            )
-                    return document
-                else:
+                # Validate Codec (required only when saving in DATA mode)
+                if codec not in (Codec.JSON, Codec.YAML):
                     raise ValueError("Invalid Codec.")
+                # Save
+                if not await ConfigIO.save(
+                    codec, document, path, threadsafe=threadsafe
+                ):
+                    raise OSError(
+                        f"Unexpected error while saving {path} | {codec.value}"
+                    )
+                return document
             except (KeyError, TypeError, ValueError, JSONDecodeError, YAMLError) as e:
                 logger.error(f"[{__name__.upper()}] Error: {e}")
         elif loader == Loader.FILE:
@@ -212,15 +233,15 @@ class ConfigIO:
     @staticmethod
     async def delete(
         loader: Literal[Loader.FILE, Loader.DATA],
-        codec: Literal[Codec.JSON, Codec.YAML],
         *,
-        data: Data = None,
-        path: Optional[PathLike] = None,
+        codec: Optional[Literal[Codec.JSON, Codec.YAML]] = None,
+        data: DataType = None,
+        path: Optional[PathType] = None,
         route: Optional[Route] = None,
         threadsafe: bool = False,
         drop: bool = False,
         save: bool = True,
-    ) -> Data:
+    ) -> DataType:
         """
         Delete using routed semantics and optionally persist.
 
@@ -233,24 +254,35 @@ class ConfigIO:
 
         Behavior:
         - Always returns the **updated document** (even when `save=True`).
-        - In DATA mode with `save=True`, `path` is required and persistence mirrors FILE mode.
+        - DATA mode: `codec` is **only required when `save=True`** (and `path` must be set).
+        - FILE mode: `codec` and `path` are required.
 
         Args:
-            loader: FILE (operate via `path`) or DATA (operate on `data`).
-            codec: `Codec.JSON` or `Codec.YAML`.
-            data: In-memory document (required in DATA mode).
-            path: Destination/source path (PathLike = str | os.PathLike).
-            route: Target path to delete.
-            threadsafe: Offload heavy parse/dump (FILE mode).
-            drop: Prune mode (see semantics).
-            save: If True, persist the updated document (requires `path` in DATA mode).
+            loader:
+                - `Loader.FILE`: operate via `path`.
+                - `Loader.DATA`: operate on `data`.
+            codec:
+                FILE mode: required. DATA mode: required only if `save=True`.
+            data:
+                In-memory document (required in DATA mode).
+            path:
+                Source/destination path (`str | os.PathLike`).
+            route:
+                Target path to delete.
+            threadsafe:
+                Offload heavy parse/dump (FILE mode).
+            drop:
+                Pruning policy (see semantics).
+            save:
+                If True, persist (requires `path`; in DATA mode also a valid `codec`).
 
         Returns:
-            The updated document (`Data`) on success; `None` if a logged error occurred.
+            Updated document on success. On recoverable issues this may return `None`
+            (treat as `DataType | None`).
 
         Raises:
             TypeError: Missing/malformed required args for the selected mode.
-            ValueError: Invalid `codec`, or DATA+`save=True` without `path`.
+            ValueError: Invalid `codec` (FILE mode, or DATA+`save=True`), or DATA+`save=True` without `path`.
             OSError: Propagated filesystem errors when persisting.
         """
         if loader == Loader.DATA:
@@ -258,18 +290,20 @@ class ConfigIO:
                 document = _delete(data, route, drop=drop)
                 if not save:
                     return document
+                # Validate Path
                 if not isinstance(path, (str, os.PathLike)):
                     raise TypeError("path must be str or os.PathLike")
-                if codec in (Codec.JSON, Codec.YAML):
-                    if not await ConfigIO.save(
-                        codec, document, path, threadsafe=threadsafe
-                    ):
-                        raise OSError(
-                            f"Unexpected error while saving {path} | {codec.value}"
-                        )
-                    return document
-                else:
+                # Validate Codec (required only when saving in DATA mode)
+                if codec not in (Codec.JSON, Codec.YAML):
                     raise ValueError("Invalid Codec.")
+                # Save
+                if not await ConfigIO.save(
+                    codec, document, path, threadsafe=threadsafe
+                ):
+                    raise OSError(
+                        f"Unexpected error while saving {path} | {codec.value}"
+                    )
+                return document
             except (KeyError, TypeError, ValueError, JSONDecodeError, YAMLError) as e:
                 logger.error(f"[{__name__.upper()}] Error: {e}")
         elif loader == Loader.FILE:
@@ -312,8 +346,8 @@ class ConfigIO:
     @staticmethod
     async def save(
         codec: Literal[Codec.JSON, Codec.YAML],
-        data: Data,
-        path: PathLike,
+        data: DataType,
+        path: PathType,
         *,
         threadsafe: bool = False,
     ) -> bool:
@@ -321,16 +355,20 @@ class ConfigIO:
         Persist a document to disk using the specified `codec`.
 
         Args:
-            codec: `Codec.JSON` or `Codec.YAML`.
-            data: Python document to persist.
-            path: Destination (PathLike = str | os.PathLike).
-            threadsafe: Offload heavy dump to a worker thread.
+            codec:
+                `Codec.JSON` or `Codec.YAML` (required).
+            data:
+                Python document to persist.
+            path:
+                Destination (`str | os.PathLike`).
+            threadsafe:
+                Offload heavy dump to a worker thread.
 
         Returns:
             True on success; False on recoverable serialization/logging errors.
 
         Raises:
-            TypeError: If `path` is not str/os.PathLike.
+            TypeError: If `path` is not `str`/`os.PathLike`.
             ValueError: Invalid `codec`.
             OSError: Propagated filesystem errors (e.g., permission issues).
         """

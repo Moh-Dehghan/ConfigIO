@@ -7,14 +7,17 @@ from collections.abc import MutableMapping
 from copy import deepcopy
 
 from pyroute import Route
-from configio.schemas import PathLike, Data
+from configio.schemas import DataType, PathType
 
 
-def _random_temp(path: PathLike) -> str:
+__all__ = ("_random_temp", "_get", "_set", "_delete")
+
+
+def _random_temp(path: PathType) -> str:
     return f"{path}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
 
 
-def _get(data: Data, route: Optional[Route]) -> Optional[Any]:
+def _get(data: DataType, route: Optional[Route]) -> Optional[Any]:
     """
     Traverse `data` along `route` and return the nested value.
 
@@ -46,12 +49,12 @@ def _get(data: Data, route: Optional[Route]) -> Optional[Any]:
 
 
 def _set(
-    data: Data,
+    data: DataType,
     route: Optional[Route] = None,
     value: Optional[Any] = None,
     *,
     overwrite_conflicts: bool = False,
-) -> Data:
+) -> DataType:
     """
     Set a nested value inside a mapping-only structure.
 
@@ -141,11 +144,11 @@ def _set(
 
 
 def _delete(
-    data: Data,
+    data: DataType,
     route: Optional[Route] = None,
     *,
     drop: bool = False,
-) -> Data:
+) -> DataType:
     """
     Delete semantics with copy-on-write (mirrors `_set`'s return style).
 

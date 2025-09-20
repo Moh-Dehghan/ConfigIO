@@ -7,10 +7,13 @@ import json
 from aiofiles import os as aios
 
 from configio.utils import _random_temp
-from configio.schemas import PathLike, Data
+from configio.schemas import DataType, PathType
 
 
-async def load(path: PathLike, threadsafe: bool = False) -> Data:
+__all__ = ("load", "save")
+
+
+async def load(path: PathType, threadsafe: bool = False) -> DataType:
     """
     Read a JSON file asynchronously and parse it into a Python object.
 
@@ -34,7 +37,7 @@ async def load(path: PathLike, threadsafe: bool = False) -> Data:
     return json.loads(text)
 
 
-async def save(path: PathLike, data: Data, threadsafe: bool = False) -> None:
+async def save(path: PathType, data: DataType, threadsafe: bool = False) -> None:
     """
     Serialize a Python object to JSON and write it to disk atomically.
 
@@ -48,7 +51,7 @@ async def save(path: PathLike, data: Data, threadsafe: bool = False) -> None:
         ValueError for invalid numbers (NaN/Inf if allow_nan=False is set).
     """
 
-    def _dump_str(d: Data) -> str:
+    def _dump_str(d: DataType) -> str:
         return json.dumps(d, ensure_ascii=False, separators=(",", ":"), sort_keys=False)
 
     text = await asyncio.to_thread(_dump_str, data) if threadsafe else _dump_str(data)

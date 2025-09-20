@@ -6,26 +6,26 @@ from typing import (
     Union,
     Hashable,
     MutableMapping,
-    MutableSequence,
-    MutableSet,
+    Sequence,
+    AbstractSet,
     TypeAlias,
+    TypeVar,
 )
 
-# Primitive scalar values common to JSON and YAML
-Scalar: TypeAlias = Union[str, int, float, bool, None]
 
-# Keys in mappings: any hashable object (string, int, tuple, etc.)
-Key: TypeAlias = Hashable
+__all__ = ("KeyType", "DataType", "PathType", "Loader", "Codec")
 
-# Unified, mutable container type for both JSON and YAML
-Data: TypeAlias = Union[
-    Scalar,
-    MutableMapping[Key, "Data"],  # e.g., dict-like, keys can be non-strings (YAML)
-    MutableSequence["Data"],  # e.g., list
-    MutableSet["Data"],  # e.g., set (YAML can contain sets)
+
+KeyType = TypeVar("KeyType", bound=Hashable)
+
+DataType: TypeAlias = Union[
+    KeyType,
+    MutableMapping[KeyType, "DataType[KeyType]"],
+    Sequence["DataType[KeyType]"],
+    AbstractSet[KeyType],
 ]
 
-PathLike = Union[str, os.PathLike[str]]
+PathType = Union[str, os.PathLike[str]]
 
 
 class Loader(Enum):

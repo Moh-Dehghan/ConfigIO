@@ -117,7 +117,7 @@ Route("a", "b", "c")      # ["a"]["b"]["c"]
 
 ## Path Types 🛣️
 
-`PathLike = Union[str, os.PathLike[str]]`  
+`PathType = Union[str, os.PathLike[str]]`  
 At runtime, both plain strings and `os.PathLike` instances are accepted and validated.
 
 ---
